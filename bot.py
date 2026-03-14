@@ -143,15 +143,24 @@ def download_media(url: str, fmt: str) -> str:
 
     if fmt == "video":
         ydl_opts = {
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            # Try progressive MP4 first, then merge best video+audio, then anything
+            "format": (
+                "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
+                "/bestvideo[height<=720]+bestaudio"
+                "/best[height<=720]"
+                "/bestvideo+bestaudio"
+                "/best"
+            ),
             "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
             "merge_output_format": "mp4",
             "quiet": True,
             "noplaylist": True,
+            # Allow format fallback
+            "ignoreerrors": False,
         }
     else:  # audio
         ydl_opts = {
-            "format": "bestaudio/best",
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
