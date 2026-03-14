@@ -22,10 +22,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Cookie support ────────────────────────────────────────────────────────────
-COOKIES_FILE = "/app/cookies.txt"  # Secret file path inside Docker container
+COOKIES_FILE = "/app/cookies.txt"
+_tmp_cookie_written = False
 
 def get_base_ydl_opts() -> dict:
-    """Base yt-dlp options with browser User-Agent and optional cookie auth."""
+    global _tmp_cookie_written
     opts = {
         "quiet": True,
         "noplaylist": True,
@@ -37,21 +38,17 @@ def get_base_ydl_opts() -> dict:
             ),
         },
     }
-    # Option 1: cookies.txt file mounted as Railway secret file
     if os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
-        logger.info("Using cookies from file: %s", COOKIES_FILE)
-    # Option 2: cookie content stored as YOUTUBE_COOKIES env variable
     else:
         cookie_str = os.environ.get("YOUTUBE_COOKIES", "").strip()
         if cookie_str:
             tmp_cookie = "/tmp/yt_cookies.txt"
-            with open(tmp_cookie, "w") as f:
-                f.write(cookie_str)
+            if not _tmp_cookie_written:
+                with open(tmp_cookie, "w") as f:
+                    f.write(cookie_str)
+                _tmp_cookie_written = True
             opts["cookiefile"] = tmp_cookie
-            logger.info("Using cookies from environment variable.")
-        else:
-            logger.warning("No YouTube cookies configured — bot detection may occur.")
     return opts
 
 
@@ -67,11 +64,88 @@ def extract_youtube_url(text: str):
     return match.group(0) if match else None
 
 
+def get_video_info(url: str) -> dict:
+    """Fetch full video info including available formats."""
+    opts = get_base_ydl_opts()
+    opts["skip_download"] = True
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def pick_video_format(formats: list) -> str:
+    """
+    Dynamically pick the best available video format string.
+    Tries to find a combined mp4, then best available.
+    """
+    # Collect available format ids
+    ids = {f.get("format_id") for f in formats}
+    exts = {f.get("ext") for f in formats}
+
+    # Find best video-only stream (prefer mp4/webm) up to 720p
+    video_formats = [
+        f for f in formats
+        if f.get("vcodec", "none") != "none"
+        and f.get("acodec", "none") == "none"
+        and f.get("height") is not None
+        and f.get("height") <= 720
+    ]
+    audio_formats = [
+        f for f in formats
+        if f.get("acodec", "none") != "none"
+        and f.get("vcodec", "none") == "none"
+    ]
+
+    if video_formats and audio_formats:
+        # Sort video by height descending
+        video_formats.sort(key=lambda x: x.get("height", 0), reverse=True)
+        best_video = video_formats[0]["format_id"]
+
+        # Prefer m4a audio
+        m4a = [f for f in audio_formats if f.get("ext") == "m4a"]
+        best_audio = (m4a or audio_formats)[0]["format_id"]
+
+        return f"{best_video}+{best_audio}"
+
+    # Fallback: best single combined format
+    combined = [
+        f for f in formats
+        if f.get("vcodec", "none") != "none"
+        and f.get("acodec", "none") != "none"
+    ]
+    if combined:
+        combined.sort(key=lambda x: x.get("height") or 0, reverse=True)
+        return combined[0]["format_id"]
+
+    # Last resort
+    return "best"
+
+
+def pick_audio_format(formats: list) -> str:
+    """Pick best available audio-only format."""
+    audio_formats = [
+        f for f in formats
+        if f.get("acodec", "none") != "none"
+        and f.get("vcodec", "none") == "none"
+    ]
+    if not audio_formats:
+        # fallback to combined and strip video later
+        return "best"
+
+    # Prefer m4a, then webm, then anything
+    for ext in ("m4a", "webm", "mp4"):
+        match = [f for f in audio_formats if f.get("ext") == ext]
+        if match:
+            match.sort(key=lambda x: x.get("abr") or 0, reverse=True)
+            return match[0]["format_id"]
+
+    audio_formats.sort(key=lambda x: x.get("abr") or 0, reverse=True)
+    return audio_formats[0]["format_id"]
+
+
 def get_video_title(url: str) -> str:
     try:
-        with yt_dlp.YoutubeDL(get_base_ydl_opts()) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return info.get("title", "Video")[:60]
+        info = get_video_info(url)
+        return info.get("title", "Video")[:60]
     except Exception:
         return "Video"
 
@@ -171,21 +245,25 @@ def download_media(url: str, fmt: str) -> str:
     tmpdir = tempfile.mkdtemp()
     opts = get_base_ydl_opts()
 
+    # ── Fetch available formats first ─────────────────────────────────────────
+    logger.info("Fetching available formats for: %s", url)
+    info = get_video_info(url)
+    formats = info.get("formats", [])
+    logger.info("Total formats available: %d", len(formats))
+
     if fmt == "video":
+        chosen_format = pick_video_format(formats)
+        logger.info("Chosen video format: %s", chosen_format)
         opts.update({
-            "format": (
-                "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
-                "/bestvideo[height<=720]+bestaudio"
-                "/best[height<=720]"
-                "/bestvideo+bestaudio"
-                "/best"
-            ),
+            "format": chosen_format,
             "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
             "merge_output_format": "mp4",
         })
     else:
+        chosen_format = pick_audio_format(formats)
+        logger.info("Chosen audio format: %s", chosen_format)
         opts.update({
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+            "format": chosen_format,
             "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
