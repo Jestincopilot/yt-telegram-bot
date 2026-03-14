@@ -21,6 +21,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── Cookie support ────────────────────────────────────────────────────────────
+COOKIES_FILE = "/app/cookies.txt"  # Secret file path inside Docker container
+
+def get_base_ydl_opts() -> dict:
+    """Base yt-dlp options with browser User-Agent and optional cookie auth."""
+    opts = {
+        "quiet": True,
+        "noplaylist": True,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+        },
+    }
+    # Option 1: cookies.txt file mounted as Railway secret file
+    if os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
+        logger.info("Using cookies from file: %s", COOKIES_FILE)
+    # Option 2: cookie content stored as YOUTUBE_COOKIES env variable
+    else:
+        cookie_str = os.environ.get("YOUTUBE_COOKIES", "").strip()
+        if cookie_str:
+            tmp_cookie = "/tmp/yt_cookies.txt"
+            with open(tmp_cookie, "w") as f:
+                f.write(cookie_str)
+            opts["cookiefile"] = tmp_cookie
+            logger.info("Using cookies from environment variable.")
+        else:
+            logger.warning("No YouTube cookies configured — bot detection may occur.")
+    return opts
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 YOUTUBE_REGEX = re.compile(
     r"(https?://)?(www\.)?"
@@ -28,16 +62,14 @@ YOUTUBE_REGEX = re.compile(
     r"[\w\-]{11}"
 )
 
-def extract_youtube_url(text: str) -> str | None:
-    """Return the first YouTube URL found in text, or None."""
+def extract_youtube_url(text: str):
     match = YOUTUBE_REGEX.search(text)
     return match.group(0) if match else None
 
 
 def get_video_title(url: str) -> str:
-    """Fetch video title without downloading."""
     try:
-        with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+        with yt_dlp.YoutubeDL(get_base_ydl_opts()) as ydl:
             info = ydl.extract_info(url, download=False)
             return info.get("title", "Video")[:60]
     except Exception:
@@ -61,9 +93,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("⚠️ Please send a valid YouTube link.")
         return
 
-    # Store URL so callback can retrieve it
     context.user_data["yt_url"] = url
-
     title = await asyncio.to_thread(get_video_title, url)
 
     keyboard = InlineKeyboardMarkup([
@@ -84,7 +114,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     await query.answer()
 
-    _, fmt = query.data.split(":")          # "download:video" or "download:audio"
+    _, fmt = query.data.split(":")
     url = context.user_data.get("yt_url")
 
     if not url:
@@ -136,14 +166,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             pass
 
 
-# ── Download logic (runs in thread) ──────────────────────────────────────────
+# ── Download logic ────────────────────────────────────────────────────────────
 def download_media(url: str, fmt: str) -> str:
-    """Download video or audio; returns path to downloaded file."""
     tmpdir = tempfile.mkdtemp()
+    opts = get_base_ydl_opts()
 
     if fmt == "video":
-        ydl_opts = {
-            # Try progressive MP4 first, then merge best video+audio, then anything
+        opts.update({
             "format": (
                 "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
                 "/bestvideo[height<=720]+bestaudio"
@@ -153,13 +182,9 @@ def download_media(url: str, fmt: str) -> str:
             ),
             "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
             "merge_output_format": "mp4",
-            "quiet": True,
-            "noplaylist": True,
-            # Allow format fallback
-            "ignoreerrors": False,
-        }
-    else:  # audio
-        ydl_opts = {
+        })
+    else:
+        opts.update({
             "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
             "postprocessors": [{
@@ -167,14 +192,11 @@ def download_media(url: str, fmt: str) -> str:
                 "preferredcodec": "mp3",
                 "preferredquality": "192",
             }],
-            "quiet": True,
-            "noplaylist": True,
-        }
+        })
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
 
-    # Find the downloaded file
     files = os.listdir(tmpdir)
     if not files:
         raise FileNotFoundError("No file was downloaded.")
@@ -188,7 +210,6 @@ def main() -> None:
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
 
     app = Application.builder().token(token).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^download:"))
