@@ -22,8 +22,9 @@ _tmp_cookie_written = False
 
 def get_cookie_opts() -> dict:
     global _tmp_cookie_written
-    if os.path.exists("/app/cookies.txt"):
-        return {"cookiefile": "/app/cookies.txt"}
+    cookie_file = "/app/cookies.txt"
+    if os.path.exists(cookie_file):
+        return {"cookiefile": cookie_file}
     cookie_str = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if cookie_str:
         tmp = "/tmp/yt_cookies.txt"
@@ -35,13 +36,19 @@ def get_cookie_opts() -> dict:
     return {}
 
 def base_opts() -> dict:
+    """
+    Use tv_embedded client — most reliable for cloud IPs.
+    tv_embedded gives pre-merged MP4 streams that don't need
+    PO tokens or SABR negotiation, and work on server IPs.
+    """
     opts = {
         "quiet": True,
         "noplaylist": True,
-        # Use android_vr client — not affected by SABR restrictions, no JS needed
         "extractor_args": {
             "youtube": {
-                "player_client": ["android_vr"],
+                # tv_embedded: stable client, no SABR, no PO token needed
+                # android_vr: fallback, works for most videos
+                "player_client": ["tv_embedded", "android_vr"],
             }
         },
     }
@@ -76,17 +83,54 @@ def download_media(url: str, fmt: str) -> str:
     opts["outtmpl"] = os.path.join(tmpdir, "%(title)s.%(ext)s")
 
     if fmt == "video":
-        opts["format"] = "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+        # format 18 = 360p MP4 pre-merged (always available via tv_embedded)
+        # format 22 = 720p MP4 pre-merged (available on most videos)
+        # We prefer 22 (720p) and fall back to 18 (360p), then best
+        opts["format"] = "22/18/best[ext=mp4]/best"
         opts["merge_output_format"] = "mp4"
     else:
-        opts["format"] = "bestaudio/best"
+        # For audio: use format 140 (m4a 128k) which is always available
+        # fallback to bestaudio then convert to mp3
+        opts["format"] = "140/bestaudio[ext=m4a]/bestaudio/best"
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }]
 
-    logger.info("Downloading %s as %s", url, fmt)
+    logger.info("Downloading %s [%s]", url, fmt)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+
+    files = os.listdir(tmpdir)
+    if not files:
+        raise FileNotFoundError("No file was downloaded.")
+    return os.path.join(tmpdir, files[0])
+
+# ── Instagram Reel downloader ─────────────────────────────────────────────────
+INSTAGRAM_RE = re.compile(
+    r"(https?://)?(www\.)?instagram\.com/(reel|p|reels)/[\w\-]+"
+)
+
+def extract_instagram_url(text: str):
+    m = INSTAGRAM_RE.search(text)
+    return m.group(0) if m else None
+
+def download_instagram(url: str) -> str:
+    tmpdir = tempfile.mkdtemp()
+    opts = {
+        "quiet": True,
+        "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
+        "format": "best[ext=mp4]/best",
+    }
+    ig_cookies = os.environ.get("INSTAGRAM_COOKIES", "").strip()
+    if ig_cookies:
+        tmp = "/tmp/ig_cookies.txt"
+        with open(tmp, "w") as f:
+            f.write(ig_cookies)
+        opts["cookiefile"] = tmp
+
+    logger.info("Downloading Instagram: %s", url)
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
 
@@ -98,29 +142,59 @@ def download_media(url: str, fmt: str) -> str:
 # ── Telegram handlers ─────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 *Welcome to YT Downloader Bot!*\n\n"
-        "Send me any YouTube link and choose:\n"
-        "🎬 *Video (MP4)* or 🎵 *Audio (MP3)*",
+        "👋 *Welcome to Downloader Bot!*\n\n"
+        "📺 Send a *YouTube* link → choose Video or Audio\n"
+        "📸 Send an *Instagram Reel* link → get the video\n\n"
+        "_Paste any link to get started!_",
         parse_mode="Markdown",
     )
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = extract_url(update.message.text)
-    if not url:
-        await update.message.reply_text("⚠️ Please send a valid YouTube link.")
+    text = update.message.text or ""
+
+    # ── Instagram Reel ──
+    ig_url = extract_instagram_url(text)
+    if ig_url:
+        await update.message.reply_text("⏳ Downloading Instagram Reel…")
+        try:
+            file_path = await asyncio.to_thread(download_instagram, ig_url)
+            with open(file_path, "rb") as f:
+                await context.bot.send_video(
+                    chat_id=update.message.chat_id,
+                    video=f,
+                    supports_streaming=True,
+                    caption="📸 Here's your Reel!",
+                    read_timeout=300, write_timeout=300,
+                )
+            await update.message.reply_text("✅ Done! Enjoy 🎉")
+        except Exception as exc:
+            logger.exception("Instagram download error")
+            await update.message.reply_text(f"❌ Failed:\n`{exc}`", parse_mode="Markdown")
+        finally:
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
         return
 
-    context.user_data["yt_url"] = url
-    title = await asyncio.to_thread(get_title, url)
+    # ── YouTube ──
+    yt_url = extract_url(text)
+    if yt_url:
+        context.user_data["yt_url"] = yt_url
+        title = await asyncio.to_thread(get_title, yt_url)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🎬 Video (MP4)", callback_data="dl:video"),
+            InlineKeyboardButton("🎵 Audio (MP3)", callback_data="dl:audio"),
+        ]])
+        await update.message.reply_text(
+            f"🎯 *{title}*\n\nChoose format:",
+            reply_markup=kb,
+            parse_mode="Markdown",
+        )
+        return
 
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🎬 Video (MP4)", callback_data="dl:video"),
-        InlineKeyboardButton("🎵 Audio (MP3)", callback_data="dl:audio"),
-    ]])
     await update.message.reply_text(
-        f"🎯 *{title}*\n\nChoose format:",
-        reply_markup=kb,
-        parse_mode="Markdown",
+        "⚠️ Please send a valid YouTube or Instagram Reel link."
     )
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
