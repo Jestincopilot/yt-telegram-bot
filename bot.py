@@ -59,10 +59,21 @@ INSTAGRAM_RE = re.compile(
     r"(https?://)?(www\.)?instagram\.com/(reel|p|reels)/[\w\-]+"
 )
 
+
+# Strict FB regex — only matches actual video/reel URLs, NOT homepage or noscript redirects
+# Supported patterns:
+#   facebook.com/watch?v=...        (regular videos)
+#   facebook.com/reel/...           (reels)
+#   facebook.com/reels/...          (reels alternate)
+#   facebook.com/video/...          (video pages)
+#   facebook.com/videos/...         (video pages alternate)
+#   facebook.com/share/v/...        (shared videos)
+#   facebook.com/share/r/...        (shared reels)
+#   fb.watch/...                    (short links)
 FACEBOOK_RE = re.compile(
-    r"(https?://)?(www\.|m\.|web\.)?"
-    r"(facebook\.com|fb\.watch)"
-    r"(/[w.-/?=&%]+)?"
+    r"https?://(www\.|m\.|web\.)?"
+    r"(facebook\.com/(watch|reel|reels|video|videos|share/v|share/r)|fb\.watch)"
+    r"[^\s]*"
 )
 
 def extract_yt_url(text: str):
@@ -139,11 +150,22 @@ def download_instagram(url: str) -> str:
 
 # ── Facebook helper ───────────────────────────────────────────────────────────
 def download_facebook(url: str) -> str:
+    # Reject homepage/noscript redirects before calling yt-dlp
+    bad_patterns = ["?_fb_noscript", "facebook.com/?", "facebook.com/#"]
+    for pat in bad_patterns:
+        if pat in url:
+            raise ValueError(
+                "Facebook redirected to its homepage instead of the video.\n\n"
+                "Please share the direct video link:\n"
+                "• Open the Facebook video in a browser\n"
+                "• Copy the URL from the address bar (should contain /watch, /reel, or /videos)\n"
+                "• Paste that link here"
+            )
+
     tmpdir = tempfile.mkdtemp()
     opts = {
         "quiet": True,
         "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
-        # Try HD first, then SD, then anything available
         "format": "best[ext=mp4][height>=720]/best[ext=mp4]/best",
         "http_headers": {
             "User-Agent": (
@@ -153,7 +175,6 @@ def download_facebook(url: str) -> str:
             ),
         },
     }
-    # Use Facebook cookies if provided (needed for private/login-required videos)
     fb_cookies = os.environ.get("FACEBOOK_COOKIES", "").strip()
     if fb_cookies:
         tmp = "/tmp/fb_cookies.txt"
