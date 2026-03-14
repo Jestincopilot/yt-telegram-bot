@@ -1,29 +1,32 @@
 FROM python:3.12-slim
 
-# Install system dependencies including Node.js 20 (required by bgutil)
+# Install system deps + Node.js 20
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    curl \
-    gnupg \
+    ffmpeg curl gnupg git \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install Python packages
+# ── Python deps ───────────────────────────────────────────────────────────────
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install bgutil POT provider plugin for yt-dlp
-# This fixes "Sign in to confirm you're not a bot" and format errors on cloud IPs
+# ── bgutil POT provider (Python plugin) ──────────────────────────────────────
 RUN pip install --no-cache-dir bgutil-ytdlp-pot-provider
 
-# Install and build the bgutil Node.js server
-RUN npm install -g @ybd-project/bgutil-ytdlp-pot-provider
+# ── bgutil POT server (Node.js HTTP server on port 4416) ─────────────────────
+# Clone the repo at the matching version tag, build the TypeScript server
+RUN git clone --depth 1 --branch 1.3.1 \
+    https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
+    /bgutil
 
-# Build the bgutil server scripts
-RUN bgutil-ytdlp-pot-provider || true
+WORKDIR /bgutil/server
+RUN npm ci && npx tsc
+
+# Back to app dir
+WORKDIR /app
 
 COPY bot.py .
 COPY start.sh .

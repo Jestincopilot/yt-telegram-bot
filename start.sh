@@ -1,15 +1,15 @@
 #!/bin/bash
 set -e
 
-echo "=== Starting bgutil POT HTTP server ==="
-# Start bgutil HTTP server in background on port 4416
-# This generates YouTube PO tokens automatically for yt-dlp
-npx --yes @ybd-project/bgutil-ytdlp-pot-provider server &
+echo "=== Starting bgutil POT HTTP server on port 4416 ==="
+cd /bgutil/server
+node dist/server.js &
 BGU_PID=$!
-echo "bgutil server started (PID $BGU_PID)"
+echo "bgutil server PID: $BGU_PID"
 
-# Give it 3 seconds to be ready
-sleep 3
+# Wait for server to be ready
+sleep 4
 
 echo "=== Starting Telegram bot ==="
+cd /app
 exec python bot.py
