@@ -36,14 +36,24 @@ def get_cookie_opts() -> dict:
     return {}
 
 def base_opts() -> dict:
+    """
+    Use android player client — bypasses SABR streaming restrictions
+    that block most cloud server IPs on the default web client.
+    """
     opts = {
-        "quiet": False,   # show logs so we can debug in Railway
+        "quiet": True,
         "noplaylist": True,
+        # KEY FIX: use android+web clients, with missing_pot to skip token errors
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],
+                "formats": ["missing_pot"],
+            }
+        },
         "http_headers": {
             "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
+                "com.google.android.youtube/19.09.37 "
+                "(Linux; U; Android 11) gzip"
             ),
         },
     }
@@ -63,53 +73,44 @@ def extract_url(text: str):
 
 def get_title(url: str) -> str:
     try:
-        with yt_dlp.YoutubeDL({**base_opts(), "skip_download": True}) as ydl:
+        opts = {**base_opts(), "skip_download": True}
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             return info.get("title", "Video")[:60]
-    except Exception:
+    except Exception as e:
+        logger.warning("Could not fetch title: %s", e)
         return "Video"
 
-# ── Download — uses only pre-merged formats (no ffmpeg combining needed) ───────
+# ── Download ──────────────────────────────────────────────────────────────────
 def download_media(url: str, fmt: str) -> str:
     tmpdir = tempfile.mkdtemp()
     opts = base_opts()
     opts["outtmpl"] = os.path.join(tmpdir, "%(title)s.%(ext)s")
 
     if fmt == "video":
-        # Only pick formats that already have BOTH video+audio in one file
-        # This avoids any "merge" step and always works
-        opts["format"] = (
-            "best[ext=mp4][height<=720]"
-            "/best[ext=webm][height<=720]"
-            "/best[height<=720]"
-            "/best[ext=mp4]"
-            "/best"
-        )
+        # Use format sorter instead of explicit format string
+        # -S flag equivalent: prefer h264, max 720p, m4a audio
+        opts["format"] = "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+        opts["format_sort"] = ["vcodec:h264", "res:720", "acodec:m4a"]
+        opts["merge_output_format"] = "mp4"
     else:
-        # Audio: extract from best available single-file format
-        opts["format"] = (
-            "best[ext=m4a]"
-            "/bestaudio[ext=m4a]"
-            "/bestaudio[ext=webm]"
-            "/bestaudio"
-            "/best"
-        )
+        opts["format"] = "bestaudio/best"
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }]
 
-    logger.info("Downloading %s as %s", url, fmt)
+    logger.info("Starting download: %s [%s]", url, fmt)
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
 
     files = os.listdir(tmpdir)
     if not files:
-        raise FileNotFoundError("No file downloaded.")
+        raise FileNotFoundError("No file was downloaded.")
     return os.path.join(tmpdir, files[0])
 
-# ── Handlers ──────────────────────────────────────────────────────────────────
+# ── Telegram handlers ─────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Welcome to YT Downloader Bot!*\n\n"
@@ -148,16 +149,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Session expired. Send the link again.")
         return
 
-    await query.edit_message_text(f"⏳ Downloading {'video 🎬' if fmt == 'video' else 'audio 🎵'}…")
+    await query.edit_message_text(
+        f"⏳ Downloading {'video 🎬' if fmt == 'video' else 'audio 🎵'}… please wait."
+    )
 
     try:
         file_path = await asyncio.to_thread(download_media, url, fmt)
     except Exception as exc:
         logger.exception("Download error")
-        await query.edit_message_text(f"❌ Failed:\n`{exc}`", parse_mode="Markdown")
+        await query.edit_message_text(f"❌ Download failed:\n`{exc}`", parse_mode="Markdown")
         return
 
-    await query.edit_message_text("📤 Uploading…")
+    await query.edit_message_text("📤 Uploading to Telegram…")
     try:
         chat_id = query.message.chat_id
         if fmt == "video":
@@ -166,14 +169,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat_id, video=f,
                     supports_streaming=True,
                     caption="🎬 Here's your video!",
-                    read_timeout=180, write_timeout=180,
+                    read_timeout=300, write_timeout=300,
                 )
         else:
             with open(file_path, "rb") as f:
                 await context.bot.send_audio(
                     chat_id=chat_id, audio=f,
                     caption="🎵 Here's your audio!",
-                    read_timeout=180, write_timeout=180,
+                    read_timeout=300, write_timeout=300,
                 )
         await query.edit_message_text("✅ Done! Enjoy 🎉")
     except Exception as exc:
