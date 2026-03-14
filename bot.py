@@ -35,96 +35,137 @@ def get_cookie_opts() -> dict:
         return {"cookiefile": tmp}
     return {}
 
-def base_opts() -> dict:
-    opts = {
-        "quiet": True,
-        "noplaylist": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["tv_embedded", "android_vr"],
-            }
-        },
-    }
-    opts.update(get_cookie_opts())
-    return opts
-
 # ── URL detectors ─────────────────────────────────────────────────────────────
 YT_RE = re.compile(
-    r"(https?://)?(www\.)?"
-    r"(youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)"
-    r"[\w\-]{11}"
+    r"https?://(www\.)?(youtube\.com/watch\?[^\s]*v=|youtu\.be/|youtube\.com/shorts/)[\w\-]{11}[^\s]*"
 )
 
 INSTAGRAM_RE = re.compile(
-    r"(https?://)?(www\.)?instagram\.com/(reel|p|reels)/[\w\-]+"
+    r"https?://(www\.)?instagram\.com/(reel|p|reels)/[\w\-]+[^\s]*"
 )
 
-
-# Strict FB regex — only matches actual video/reel URLs, NOT homepage or noscript redirects
-# Supported patterns:
-#   facebook.com/watch?v=...        (regular videos)
-#   facebook.com/reel/...           (reels)
-#   facebook.com/reels/...          (reels alternate)
-#   facebook.com/video/...          (video pages)
-#   facebook.com/videos/...         (video pages alternate)
-#   facebook.com/share/v/...        (shared videos)
-#   facebook.com/share/r/...        (shared reels)
-#   fb.watch/...                    (short links)
 FACEBOOK_RE = re.compile(
     r"https?://(www\.|m\.|web\.)?"
     r"(facebook\.com/(watch|reel|reels|video|videos|share/v|share/r)|fb\.watch)"
     r"[^\s]*"
 )
 
-def extract_yt_url(text: str):
+def extract_yt_url(text):
     m = YT_RE.search(text)
     return m.group(0) if m else None
 
-def extract_ig_url(text: str):
+def extract_ig_url(text):
     m = INSTAGRAM_RE.search(text)
     return m.group(0) if m else None
 
-def extract_fb_url(text: str):
+def extract_fb_url(text):
     m = FACEBOOK_RE.search(text)
     return m.group(0) if m else None
 
-# ── YouTube helpers ───────────────────────────────────────────────────────────
-def get_title(url: str) -> str:
-    try:
-        opts = {**base_opts(), "skip_download": True}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return info.get("title", "Video")[:60]
-    except Exception as e:
-        logger.warning("Could not fetch title: %s", e)
-        return "Video"
-
-def download_yt(url: str, fmt: str) -> str:
+# ── Core downloader — tries multiple strategies until one works ───────────────
+def smart_download(url: str, want_audio_only: bool = False) -> str:
+    """
+    Try multiple yt-dlp strategies in order.
+    Returns path to downloaded file.
+    Raises RuntimeError with a helpful message if all strategies fail.
+    """
     tmpdir = tempfile.mkdtemp()
-    opts = base_opts()
-    opts["outtmpl"] = os.path.join(tmpdir, "%(title)s.%(ext)s")
 
-    if fmt == "video":
-        opts["format"] = "22/18/best[ext=mp4]/best"
-        opts["merge_output_format"] = "mp4"
+    # Build cookie part
+    cookie_opts = get_cookie_opts()
+
+    # Common headers to look like a real browser
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+    }
+
+    # ── Strategy list — tried in order until one succeeds ─────────────────────
+    # Each entry: (description, extra_opts_dict)
+    strategies = []
+
+    if want_audio_only:
+        strategies = [
+            ("audio/bestaudio+mp3", {
+                "format": "bestaudio/best",
+                "postprocessors": [{"key": "FFmpegExtractAudio",
+                                    "preferredcodec": "mp3",
+                                    "preferredquality": "192"}],
+            }),
+            ("audio/140", {
+                "format": "140/bestaudio/best",
+                "postprocessors": [{"key": "FFmpegExtractAudio",
+                                    "preferredcodec": "mp3",
+                                    "preferredquality": "192"}],
+            }),
+        ]
     else:
-        opts["format"] = "140/bestaudio[ext=m4a]/bestaudio/best"
-        opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }]
+        strategies = [
+            # Strategy 1: android_embedded — no PO token, no SABR, pre-merged mp4
+            ("video/android_embedded", {
+                "format": "b[ext=mp4]/b",
+                "extractor_args": {"youtube": {"player_client": ["android_embedded"]}},
+            }),
+            # Strategy 2: ios client — gives direct mp4 URLs
+            ("video/ios", {
+                "format": "b[ext=mp4]/b",
+                "extractor_args": {"youtube": {"player_client": ["ios"]}},
+            }),
+            # Strategy 3: tv_embedded — no SABR
+            ("video/tv_embedded", {
+                "format": "b[ext=mp4]/b",
+                "extractor_args": {"youtube": {"player_client": ["tv_embedded"]}},
+            }),
+            # Strategy 4: mweb — mobile web client
+            ("video/mweb", {
+                "format": "b[ext=mp4]/b",
+                "extractor_args": {"youtube": {"player_client": ["mweb"]}},
+            }),
+            # Strategy 5: default client, just grab absolute best single file
+            ("video/default_best", {
+                "format": "b",
+            }),
+            # Strategy 6: format_sort fallback — let yt-dlp decide everything
+            ("video/format_sort", {
+                "format": "bv*+ba/b",
+                "format_sort": ["res:720", "ext:mp4:m4a"],
+                "merge_output_format": "mp4",
+            }),
+        ]
 
-    logger.info("YT download: %s [%s]", url, fmt)
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
+    last_error = None
+    for name, extra in strategies:
+        attempt_dir = tempfile.mkdtemp()
+        opts = {
+            "quiet": True,
+            "noplaylist": True,
+            "outtmpl": os.path.join(attempt_dir, "%(title)s.%(ext)s"),
+            "http_headers": headers,
+            **cookie_opts,
+            **extra,
+        }
+        try:
+            logger.info("Trying strategy: %s for %s", name, url)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+            files = os.listdir(attempt_dir)
+            if files:
+                logger.info("Success with strategy: %s", name)
+                return os.path.join(attempt_dir, files[0])
+        except Exception as e:
+            last_error = e
+            logger.warning("Strategy %s failed: %s", name, e)
+            continue
 
-    files = os.listdir(tmpdir)
-    if not files:
-        raise FileNotFoundError("No file was downloaded.")
-    return os.path.join(tmpdir, files[0])
+    raise RuntimeError(
+        f"All download strategies failed.\nLast error: {last_error}\n\n"
+        "This video may be age-restricted, private, or region-blocked."
+    )
 
-# ── Instagram helper ──────────────────────────────────────────────────────────
+# ── Instagram downloader ──────────────────────────────────────────────────────
 def download_instagram(url: str) -> str:
     tmpdir = tempfile.mkdtemp()
     opts = {
@@ -138,35 +179,28 @@ def download_instagram(url: str) -> str:
         with open(tmp, "w") as f:
             f.write(ig_cookies)
         opts["cookiefile"] = tmp
-
-    logger.info("Instagram download: %s", url)
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
-
     files = os.listdir(tmpdir)
     if not files:
-        raise FileNotFoundError("No file was downloaded.")
+        raise FileNotFoundError("No file downloaded.")
     return os.path.join(tmpdir, files[0])
 
-# ── Facebook helper ───────────────────────────────────────────────────────────
+# ── Facebook downloader ───────────────────────────────────────────────────────
 def download_facebook(url: str) -> str:
-    # Reject homepage/noscript redirects before calling yt-dlp
-    bad_patterns = ["?_fb_noscript", "facebook.com/?", "facebook.com/#"]
-    for pat in bad_patterns:
-        if pat in url:
+    bad = ["?_fb_noscript", "facebook.com/?", "facebook.com/#"]
+    for b in bad:
+        if b in url:
             raise ValueError(
-                "Facebook redirected to its homepage instead of the video.\n\n"
-                "Please share the direct video link:\n"
-                "• Open the Facebook video in a browser\n"
-                "• Copy the URL from the address bar (should contain /watch, /reel, or /videos)\n"
-                "• Paste that link here"
+                "Facebook redirected to homepage instead of the video.\n\n"
+                "Please copy the direct link from your browser address bar.\n"
+                "It should contain: /watch, /reel, or /videos"
             )
-
     tmpdir = tempfile.mkdtemp()
     opts = {
         "quiet": True,
         "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
-        "format": "best[ext=mp4][height>=720]/best[ext=mp4]/best",
+        "format": "best[ext=mp4]/best",
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -181,28 +215,49 @@ def download_facebook(url: str) -> str:
         with open(tmp, "w") as f:
             f.write(fb_cookies)
         opts["cookiefile"] = tmp
-        logger.info("Facebook: using cookies")
-
-    logger.info("Facebook download: %s", url)
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
-
     files = os.listdir(tmpdir)
     if not files:
-        raise FileNotFoundError("No file was downloaded.")
+        raise FileNotFoundError("No file downloaded.")
     return os.path.join(tmpdir, files[0])
 
-# ── Generic send video helper ─────────────────────────────────────────────────
-async def send_video_file(context, chat_id: int, file_path: str, caption: str):
+# ── get YouTube title ─────────────────────────────────────────────────────────
+def get_yt_title(url: str) -> str:
+    try:
+        opts = {
+            "quiet": True,
+            "skip_download": True,
+            "extractor_args": {"youtube": {"player_client": ["android_embedded"]}},
+            **get_cookie_opts(),
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info.get("title", "Video")[:60]
+    except Exception:
+        return "Video"
+
+# ── Generic upload helper ─────────────────────────────────────────────────────
+async def upload_video(context, chat_id: int, file_path: str, caption: str):
     with open(file_path, "rb") as f:
         await context.bot.send_video(
-            chat_id=chat_id,
-            video=f,
-            supports_streaming=True,
-            caption=caption,
-            read_timeout=300,
-            write_timeout=300,
+            chat_id=chat_id, video=f,
+            supports_streaming=True, caption=caption,
+            read_timeout=300, write_timeout=300,
         )
+
+async def upload_audio(context, chat_id: int, file_path: str, caption: str):
+    with open(file_path, "rb") as f:
+        await context.bot.send_audio(
+            chat_id=chat_id, audio=f, caption=caption,
+            read_timeout=300, write_timeout=300,
+        )
+
+def cleanup(path: str):
+    try:
+        os.remove(path)
+    except Exception:
+        pass
 
 # ── Telegram handlers ─────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -227,15 +282,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_path = None
         try:
             file_path = await asyncio.to_thread(download_instagram, ig_url)
-            await send_video_file(context, chat_id, file_path, "📸 Here's your Instagram video!")
+            await upload_video(context, chat_id, file_path, "📸 Here's your Instagram video!")
             await msg.edit_text("✅ Done! Enjoy 🎉")
         except Exception as exc:
             logger.exception("Instagram error")
             await msg.edit_text(f"❌ Failed:\n`{exc}`", parse_mode="Markdown")
         finally:
             if file_path:
-                try: os.remove(file_path)
-                except OSError: pass
+                cleanup(file_path)
         return
 
     # ── Facebook ───────────────────────────────────────────────────────────────
@@ -245,22 +299,21 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_path = None
         try:
             file_path = await asyncio.to_thread(download_facebook, fb_url)
-            await send_video_file(context, chat_id, file_path, "📘 Here's your Facebook video!")
+            await upload_video(context, chat_id, file_path, "📘 Here's your Facebook video!")
             await msg.edit_text("✅ Done! Enjoy 🎉")
         except Exception as exc:
             logger.exception("Facebook error")
             await msg.edit_text(f"❌ Failed:\n`{exc}`", parse_mode="Markdown")
         finally:
             if file_path:
-                try: os.remove(file_path)
-                except OSError: pass
+                cleanup(file_path)
         return
 
     # ── YouTube ────────────────────────────────────────────────────────────────
     yt_url = extract_yt_url(text)
     if yt_url:
         context.user_data["yt_url"] = yt_url
-        title = await asyncio.to_thread(get_title, yt_url)
+        title = await asyncio.to_thread(get_yt_title, yt_url)
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("🎬 Video (MP4)", callback_data="dl:video"),
             InlineKeyboardButton("🎵 Audio (MP3)", callback_data="dl:audio"),
@@ -287,13 +340,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Session expired. Send the link again.")
         return
 
+    want_audio = (fmt == "audio")
     await query.edit_message_text(
-        f"⏳ Downloading {'video 🎬' if fmt == 'video' else 'audio 🎵'}… please wait."
+        f"⏳ Downloading {'audio 🎵' if want_audio else 'video 🎬'}… please wait."
     )
 
     file_path = None
     try:
-        file_path = await asyncio.to_thread(download_yt, url, fmt)
+        file_path = await asyncio.to_thread(smart_download, url, want_audio)
     except Exception as exc:
         logger.exception("YT download error")
         await query.edit_message_text(f"❌ Download failed:\n`{exc}`", parse_mode="Markdown")
@@ -302,29 +356,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text("📤 Uploading to Telegram…")
     try:
         chat_id = query.message.chat_id
-        if fmt == "video":
-            with open(file_path, "rb") as f:
-                await context.bot.send_video(
-                    chat_id=chat_id, video=f,
-                    supports_streaming=True,
-                    caption="🎬 Here's your video!",
-                    read_timeout=300, write_timeout=300,
-                )
+        if want_audio:
+            await upload_audio(context, chat_id, file_path, "🎵 Here's your audio!")
         else:
-            with open(file_path, "rb") as f:
-                await context.bot.send_audio(
-                    chat_id=chat_id, audio=f,
-                    caption="🎵 Here's your audio!",
-                    read_timeout=300, write_timeout=300,
-                )
+            await upload_video(context, chat_id, file_path, "🎬 Here's your video!")
         await query.edit_message_text("✅ Done! Enjoy 🎉")
     except Exception as exc:
         logger.exception("Upload error")
         await query.edit_message_text(f"❌ Upload failed:\n`{exc}`", parse_mode="Markdown")
     finally:
         if file_path:
-            try: os.remove(file_path)
-            except OSError: pass
+            cleanup(file_path)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
