@@ -14,21 +14,30 @@ from telegram.ext import (
     filters,
 )
 
-# ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Cookie support ────────────────────────────────────────────────────────────
-COOKIES_FILE = "/app/cookies.txt"
+# ── Cookies ───────────────────────────────────────────────────────────────────
 _tmp_cookie_written = False
 
-def get_base_ydl_opts() -> dict:
+def get_cookie_opts() -> dict:
     global _tmp_cookie_written
+    cookie_file = "/app/cookies.txt"
+    if os.path.exists(cookie_file):
+        return {"cookiefile": cookie_file}
+    cookie_str = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if cookie_str:
+        tmp = "/tmp/yt_cookies.txt"
+        if not _tmp_cookie_written:
+            with open(tmp, "w") as f:
+                f.write(cookie_str)
+            _tmp_cookie_written = True
+        return {"cookiefile": tmp}
+    return {}
+
+def base_opts() -> dict:
     opts = {
-        "quiet": True,
+        "quiet": False,   # show logs so we can debug in Railway
         "noplaylist": True,
         "http_headers": {
             "User-Agent": (
@@ -38,153 +47,97 @@ def get_base_ydl_opts() -> dict:
             ),
         },
     }
-    if os.path.exists(COOKIES_FILE):
-        opts["cookiefile"] = COOKIES_FILE
-    else:
-        cookie_str = os.environ.get("YOUTUBE_COOKIES", "").strip()
-        if cookie_str:
-            tmp_cookie = "/tmp/yt_cookies.txt"
-            if not _tmp_cookie_written:
-                with open(tmp_cookie, "w") as f:
-                    f.write(cookie_str)
-                _tmp_cookie_written = True
-            opts["cookiefile"] = tmp_cookie
+    opts.update(get_cookie_opts())
     return opts
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-YOUTUBE_REGEX = re.compile(
+# ── YouTube URL detector ──────────────────────────────────────────────────────
+YT_RE = re.compile(
     r"(https?://)?(www\.)?"
     r"(youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)"
     r"[\w\-]{11}"
 )
 
-def extract_youtube_url(text: str):
-    match = YOUTUBE_REGEX.search(text)
-    return match.group(0) if match else None
+def extract_url(text: str):
+    m = YT_RE.search(text)
+    return m.group(0) if m else None
 
-
-def get_video_info(url: str) -> dict:
-    """Fetch full video info including available formats."""
-    opts = get_base_ydl_opts()
-    opts["skip_download"] = True
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
-
-
-def pick_video_format(formats: list) -> str:
-    """
-    Dynamically pick the best available video format string.
-    Tries to find a combined mp4, then best available.
-    """
-    # Collect available format ids
-    ids = {f.get("format_id") for f in formats}
-    exts = {f.get("ext") for f in formats}
-
-    # Find best video-only stream (prefer mp4/webm) up to 720p
-    video_formats = [
-        f for f in formats
-        if f.get("vcodec", "none") != "none"
-        and f.get("acodec", "none") == "none"
-        and f.get("height") is not None
-        and f.get("height") <= 720
-    ]
-    audio_formats = [
-        f for f in formats
-        if f.get("acodec", "none") != "none"
-        and f.get("vcodec", "none") == "none"
-    ]
-
-    if video_formats and audio_formats:
-        # Sort video by height descending
-        video_formats.sort(key=lambda x: x.get("height", 0), reverse=True)
-        best_video = video_formats[0]["format_id"]
-
-        # Prefer m4a audio
-        m4a = [f for f in audio_formats if f.get("ext") == "m4a"]
-        best_audio = (m4a or audio_formats)[0]["format_id"]
-
-        return f"{best_video}+{best_audio}"
-
-    # Fallback: best single combined format
-    combined = [
-        f for f in formats
-        if f.get("vcodec", "none") != "none"
-        and f.get("acodec", "none") != "none"
-    ]
-    if combined:
-        combined.sort(key=lambda x: x.get("height") or 0, reverse=True)
-        return combined[0]["format_id"]
-
-    # Last resort
-    return "best"
-
-
-def pick_audio_format(formats: list) -> str:
-    """Pick best available audio-only format."""
-    audio_formats = [
-        f for f in formats
-        if f.get("acodec", "none") != "none"
-        and f.get("vcodec", "none") == "none"
-    ]
-    if not audio_formats:
-        # fallback to combined and strip video later
-        return "best"
-
-    # Prefer m4a, then webm, then anything
-    for ext in ("m4a", "webm", "mp4"):
-        match = [f for f in audio_formats if f.get("ext") == ext]
-        if match:
-            match.sort(key=lambda x: x.get("abr") or 0, reverse=True)
-            return match[0]["format_id"]
-
-    audio_formats.sort(key=lambda x: x.get("abr") or 0, reverse=True)
-    return audio_formats[0]["format_id"]
-
-
-def get_video_title(url: str) -> str:
+def get_title(url: str) -> str:
     try:
-        info = get_video_info(url)
-        return info.get("title", "Video")[:60]
+        with yt_dlp.YoutubeDL({**base_opts(), "skip_download": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info.get("title", "Video")[:60]
     except Exception:
         return "Video"
 
+# ── Download — uses only pre-merged formats (no ffmpeg combining needed) ───────
+def download_media(url: str, fmt: str) -> str:
+    tmpdir = tempfile.mkdtemp()
+    opts = base_opts()
+    opts["outtmpl"] = os.path.join(tmpdir, "%(title)s.%(ext)s")
+
+    if fmt == "video":
+        # Only pick formats that already have BOTH video+audio in one file
+        # This avoids any "merge" step and always works
+        opts["format"] = (
+            "best[ext=mp4][height<=720]"
+            "/best[ext=webm][height<=720]"
+            "/best[height<=720]"
+            "/best[ext=mp4]"
+            "/best"
+        )
+    else:
+        # Audio: extract from best available single-file format
+        opts["format"] = (
+            "best[ext=m4a]"
+            "/bestaudio[ext=m4a]"
+            "/bestaudio[ext=webm]"
+            "/bestaudio"
+            "/best"
+        )
+        opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }]
+
+    logger.info("Downloading %s as %s", url, fmt)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+
+    files = os.listdir(tmpdir)
+    if not files:
+        raise FileNotFoundError("No file downloaded.")
+    return os.path.join(tmpdir, files[0])
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Welcome to YT Downloader Bot!*\n\n"
-        "Just send me any YouTube link and I'll let you choose:\n"
-        "🎬 *Video* (MP4) or 🎵 *Audio* (MP3)\n\n"
-        "_Paste a link to get started!_",
+        "Send me any YouTube link and choose:\n"
+        "🎬 *Video (MP4)* or 🎵 *Audio (MP3)*",
         parse_mode="Markdown",
     )
 
-
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    url = extract_youtube_url(update.message.text)
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = extract_url(update.message.text)
     if not url:
         await update.message.reply_text("⚠️ Please send a valid YouTube link.")
         return
 
     context.user_data["yt_url"] = url
-    title = await asyncio.to_thread(get_video_title, url)
+    title = await asyncio.to_thread(get_title, url)
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🎬 Video (MP4)", callback_data="download:video"),
-            InlineKeyboardButton("🎵 Audio (MP3)", callback_data="download:audio"),
-        ]
-    ])
-
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎬 Video (MP4)", callback_data="dl:video"),
+        InlineKeyboardButton("🎵 Audio (MP3)", callback_data="dl:audio"),
+    ]])
     await update.message.reply_text(
-        f"🎯 *{title}*\n\nChoose a download format:",
-        reply_markup=keyboard,
+        f"🎯 *{title}*\n\nChoose format:",
+        reply_markup=kb,
         parse_mode="Markdown",
     )
 
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
@@ -192,46 +145,39 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     url = context.user_data.get("yt_url")
 
     if not url:
-        await query.edit_message_text("⚠️ Session expired. Please send the link again.")
+        await query.edit_message_text("⚠️ Session expired. Send the link again.")
         return
 
-    await query.edit_message_text(
-        f"⏳ Downloading {'video 🎬' if fmt == 'video' else 'audio 🎵'} … please wait."
-    )
+    await query.edit_message_text(f"⏳ Downloading {'video 🎬' if fmt == 'video' else 'audio 🎵'}…")
 
     try:
         file_path = await asyncio.to_thread(download_media, url, fmt)
     except Exception as exc:
-        logger.exception("Download failed")
-        await query.edit_message_text(f"❌ Download failed:\n`{exc}`", parse_mode="Markdown")
+        logger.exception("Download error")
+        await query.edit_message_text(f"❌ Failed:\n`{exc}`", parse_mode="Markdown")
         return
 
-    await query.edit_message_text("📤 Uploading to Telegram…")
-
+    await query.edit_message_text("📤 Uploading…")
     try:
         chat_id = query.message.chat_id
         if fmt == "video":
             with open(file_path, "rb") as f:
                 await context.bot.send_video(
-                    chat_id=chat_id,
-                    video=f,
+                    chat_id=chat_id, video=f,
                     supports_streaming=True,
                     caption="🎬 Here's your video!",
-                    read_timeout=120,
-                    write_timeout=120,
+                    read_timeout=180, write_timeout=180,
                 )
         else:
             with open(file_path, "rb") as f:
                 await context.bot.send_audio(
-                    chat_id=chat_id,
-                    audio=f,
+                    chat_id=chat_id, audio=f,
                     caption="🎵 Here's your audio!",
-                    read_timeout=120,
-                    write_timeout=120,
+                    read_timeout=180, write_timeout=180,
                 )
         await query.edit_message_text("✅ Done! Enjoy 🎉")
     except Exception as exc:
-        logger.exception("Upload failed")
+        logger.exception("Upload error")
         await query.edit_message_text(f"❌ Upload failed:\n`{exc}`", parse_mode="Markdown")
     finally:
         try:
@@ -239,62 +185,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except OSError:
             pass
 
-
-# ── Download logic ────────────────────────────────────────────────────────────
-def download_media(url: str, fmt: str) -> str:
-    tmpdir = tempfile.mkdtemp()
-    opts = get_base_ydl_opts()
-
-    # ── Fetch available formats first ─────────────────────────────────────────
-    logger.info("Fetching available formats for: %s", url)
-    info = get_video_info(url)
-    formats = info.get("formats", [])
-    logger.info("Total formats available: %d", len(formats))
-
-    if fmt == "video":
-        chosen_format = pick_video_format(formats)
-        logger.info("Chosen video format: %s", chosen_format)
-        opts.update({
-            "format": chosen_format,
-            "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
-            "merge_output_format": "mp4",
-        })
-    else:
-        chosen_format = pick_audio_format(formats)
-        logger.info("Chosen audio format: %s", chosen_format)
-        opts.update({
-            "format": chosen_format,
-            "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-        })
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
-
-    files = os.listdir(tmpdir)
-    if not files:
-        raise FileNotFoundError("No file was downloaded.")
-    return os.path.join(tmpdir, files[0])
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-def main() -> None:
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
-        raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set!")
+        raise ValueError("TELEGRAM_BOT_TOKEN not set!")
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^download:"))
+    app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^dl:"))
 
     logger.info("Bot is running…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
