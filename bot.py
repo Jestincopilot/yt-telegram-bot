@@ -22,9 +22,8 @@ _tmp_cookie_written = False
 
 def get_cookie_opts() -> dict:
     global _tmp_cookie_written
-    cookie_file = "/app/cookies.txt"
-    if os.path.exists(cookie_file):
-        return {"cookiefile": cookie_file}
+    if os.path.exists("/app/cookies.txt"):
+        return {"cookiefile": "/app/cookies.txt"}
     cookie_str = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if cookie_str:
         tmp = "/tmp/yt_cookies.txt"
@@ -36,25 +35,14 @@ def get_cookie_opts() -> dict:
     return {}
 
 def base_opts() -> dict:
-    """
-    Use android player client — bypasses SABR streaming restrictions
-    that block most cloud server IPs on the default web client.
-    """
     opts = {
         "quiet": True,
         "noplaylist": True,
-        # KEY FIX: use android+web clients, with missing_pot to skip token errors
+        # Use android_vr client — not affected by SABR restrictions, no JS needed
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web"],
-                "formats": ["missing_pot"],
+                "player_client": ["android_vr"],
             }
-        },
-        "http_headers": {
-            "User-Agent": (
-                "com.google.android.youtube/19.09.37 "
-                "(Linux; U; Android 11) gzip"
-            ),
         },
     }
     opts.update(get_cookie_opts())
@@ -88,10 +76,7 @@ def download_media(url: str, fmt: str) -> str:
     opts["outtmpl"] = os.path.join(tmpdir, "%(title)s.%(ext)s")
 
     if fmt == "video":
-        # Use format sorter instead of explicit format string
-        # -S flag equivalent: prefer h264, max 720p, m4a audio
-        opts["format"] = "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
-        opts["format_sort"] = ["vcodec:h264", "res:720", "acodec:m4a"]
+        opts["format"] = "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best"
         opts["merge_output_format"] = "mp4"
     else:
         opts["format"] = "bestaudio/best"
@@ -101,7 +86,7 @@ def download_media(url: str, fmt: str) -> str:
             "preferredquality": "192",
         }]
 
-    logger.info("Starting download: %s [%s]", url, fmt)
+    logger.info("Downloading %s as %s", url, fmt)
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
 
