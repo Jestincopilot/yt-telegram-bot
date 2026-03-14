@@ -36,18 +36,11 @@ def get_cookie_opts() -> dict:
     return {}
 
 def base_opts() -> dict:
-    """
-    Use tv_embedded client — most reliable for cloud IPs.
-    tv_embedded gives pre-merged MP4 streams that don't need
-    PO tokens or SABR negotiation, and work on server IPs.
-    """
     opts = {
         "quiet": True,
         "noplaylist": True,
         "extractor_args": {
             "youtube": {
-                # tv_embedded: stable client, no SABR, no PO token needed
-                # android_vr: fallback, works for most videos
                 "player_client": ["tv_embedded", "android_vr"],
             }
         },
@@ -55,17 +48,36 @@ def base_opts() -> dict:
     opts.update(get_cookie_opts())
     return opts
 
-# ── YouTube URL detector ──────────────────────────────────────────────────────
+# ── URL detectors ─────────────────────────────────────────────────────────────
 YT_RE = re.compile(
     r"(https?://)?(www\.)?"
     r"(youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)"
     r"[\w\-]{11}"
 )
 
-def extract_url(text: str):
+INSTAGRAM_RE = re.compile(
+    r"(https?://)?(www\.)?instagram\.com/(reel|p|reels)/[\w\-]+"
+)
+
+FACEBOOK_RE = re.compile(
+    r"(https?://)?(www\.|m\.|web\.)?"
+    r"(facebook\.com|fb\.watch)"
+    r"(/[w.-/?=&%]+)?"
+)
+
+def extract_yt_url(text: str):
     m = YT_RE.search(text)
     return m.group(0) if m else None
 
+def extract_ig_url(text: str):
+    m = INSTAGRAM_RE.search(text)
+    return m.group(0) if m else None
+
+def extract_fb_url(text: str):
+    m = FACEBOOK_RE.search(text)
+    return m.group(0) if m else None
+
+# ── YouTube helpers ───────────────────────────────────────────────────────────
 def get_title(url: str) -> str:
     try:
         opts = {**base_opts(), "skip_download": True}
@@ -76,21 +88,15 @@ def get_title(url: str) -> str:
         logger.warning("Could not fetch title: %s", e)
         return "Video"
 
-# ── Download ──────────────────────────────────────────────────────────────────
-def download_media(url: str, fmt: str) -> str:
+def download_yt(url: str, fmt: str) -> str:
     tmpdir = tempfile.mkdtemp()
     opts = base_opts()
     opts["outtmpl"] = os.path.join(tmpdir, "%(title)s.%(ext)s")
 
     if fmt == "video":
-        # format 18 = 360p MP4 pre-merged (always available via tv_embedded)
-        # format 22 = 720p MP4 pre-merged (available on most videos)
-        # We prefer 22 (720p) and fall back to 18 (360p), then best
         opts["format"] = "22/18/best[ext=mp4]/best"
         opts["merge_output_format"] = "mp4"
     else:
-        # For audio: use format 140 (m4a 128k) which is always available
-        # fallback to bestaudio then convert to mp3
         opts["format"] = "140/bestaudio[ext=m4a]/bestaudio/best"
         opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
@@ -98,7 +104,7 @@ def download_media(url: str, fmt: str) -> str:
             "preferredquality": "192",
         }]
 
-    logger.info("Downloading %s [%s]", url, fmt)
+    logger.info("YT download: %s [%s]", url, fmt)
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
 
@@ -107,15 +113,7 @@ def download_media(url: str, fmt: str) -> str:
         raise FileNotFoundError("No file was downloaded.")
     return os.path.join(tmpdir, files[0])
 
-# ── Instagram Reel downloader ─────────────────────────────────────────────────
-INSTAGRAM_RE = re.compile(
-    r"(https?://)?(www\.)?instagram\.com/(reel|p|reels)/[\w\-]+"
-)
-
-def extract_instagram_url(text: str):
-    m = INSTAGRAM_RE.search(text)
-    return m.group(0) if m else None
-
+# ── Instagram helper ──────────────────────────────────────────────────────────
 def download_instagram(url: str) -> str:
     tmpdir = tempfile.mkdtemp()
     opts = {
@@ -130,7 +128,7 @@ def download_instagram(url: str) -> str:
             f.write(ig_cookies)
         opts["cookiefile"] = tmp
 
-    logger.info("Downloading Instagram: %s", url)
+    logger.info("Instagram download: %s", url)
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
 
@@ -139,46 +137,106 @@ def download_instagram(url: str) -> str:
         raise FileNotFoundError("No file was downloaded.")
     return os.path.join(tmpdir, files[0])
 
+# ── Facebook helper ───────────────────────────────────────────────────────────
+def download_facebook(url: str) -> str:
+    tmpdir = tempfile.mkdtemp()
+    opts = {
+        "quiet": True,
+        "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
+        # Try HD first, then SD, then anything available
+        "format": "best[ext=mp4][height>=720]/best[ext=mp4]/best",
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+        },
+    }
+    # Use Facebook cookies if provided (needed for private/login-required videos)
+    fb_cookies = os.environ.get("FACEBOOK_COOKIES", "").strip()
+    if fb_cookies:
+        tmp = "/tmp/fb_cookies.txt"
+        with open(tmp, "w") as f:
+            f.write(fb_cookies)
+        opts["cookiefile"] = tmp
+        logger.info("Facebook: using cookies")
+
+    logger.info("Facebook download: %s", url)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+
+    files = os.listdir(tmpdir)
+    if not files:
+        raise FileNotFoundError("No file was downloaded.")
+    return os.path.join(tmpdir, files[0])
+
+# ── Generic send video helper ─────────────────────────────────────────────────
+async def send_video_file(context, chat_id: int, file_path: str, caption: str):
+    with open(file_path, "rb") as f:
+        await context.bot.send_video(
+            chat_id=chat_id,
+            video=f,
+            supports_streaming=True,
+            caption=caption,
+            read_timeout=300,
+            write_timeout=300,
+        )
+
 # ── Telegram handlers ─────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Welcome to Downloader Bot!*\n\n"
-        "📺 Send a *YouTube* link → choose Video or Audio\n"
-        "📸 Send an *Instagram Reel* link → get the video\n\n"
-        "_Paste any link to get started!_",
+        "Supported platforms:\n"
+        "📺 *YouTube* — Video (MP4) or Audio (MP3)\n"
+        "📸 *Instagram* — Reels & Posts\n"
+        "📘 *Facebook* — Videos & Reels\n\n"
+        "_Just paste any link to get started!_",
         parse_mode="Markdown",
     )
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
+    chat_id = update.message.chat_id
 
-    # ── Instagram Reel ──
-    ig_url = extract_instagram_url(text)
+    # ── Instagram ──────────────────────────────────────────────────────────────
+    ig_url = extract_ig_url(text)
     if ig_url:
-        await update.message.reply_text("⏳ Downloading Instagram Reel…")
+        msg = await update.message.reply_text("⏳ Downloading Instagram video…")
+        file_path = None
         try:
             file_path = await asyncio.to_thread(download_instagram, ig_url)
-            with open(file_path, "rb") as f:
-                await context.bot.send_video(
-                    chat_id=update.message.chat_id,
-                    video=f,
-                    supports_streaming=True,
-                    caption="📸 Here's your Reel!",
-                    read_timeout=300, write_timeout=300,
-                )
-            await update.message.reply_text("✅ Done! Enjoy 🎉")
+            await send_video_file(context, chat_id, file_path, "📸 Here's your Instagram video!")
+            await msg.edit_text("✅ Done! Enjoy 🎉")
         except Exception as exc:
-            logger.exception("Instagram download error")
-            await update.message.reply_text(f"❌ Failed:\n`{exc}`", parse_mode="Markdown")
+            logger.exception("Instagram error")
+            await msg.edit_text(f"❌ Failed:\n`{exc}`", parse_mode="Markdown")
         finally:
-            try:
-                os.remove(file_path)
-            except Exception:
-                pass
+            if file_path:
+                try: os.remove(file_path)
+                except OSError: pass
         return
 
-    # ── YouTube ──
-    yt_url = extract_url(text)
+    # ── Facebook ───────────────────────────────────────────────────────────────
+    fb_url = extract_fb_url(text)
+    if fb_url:
+        msg = await update.message.reply_text("⏳ Downloading Facebook video…")
+        file_path = None
+        try:
+            file_path = await asyncio.to_thread(download_facebook, fb_url)
+            await send_video_file(context, chat_id, file_path, "📘 Here's your Facebook video!")
+            await msg.edit_text("✅ Done! Enjoy 🎉")
+        except Exception as exc:
+            logger.exception("Facebook error")
+            await msg.edit_text(f"❌ Failed:\n`{exc}`", parse_mode="Markdown")
+        finally:
+            if file_path:
+                try: os.remove(file_path)
+                except OSError: pass
+        return
+
+    # ── YouTube ────────────────────────────────────────────────────────────────
+    yt_url = extract_yt_url(text)
     if yt_url:
         context.user_data["yt_url"] = yt_url
         title = await asyncio.to_thread(get_title, yt_url)
@@ -194,7 +252,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "⚠️ Please send a valid YouTube or Instagram Reel link."
+        "⚠️ Please send a valid YouTube, Instagram, or Facebook link."
     )
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -212,10 +270,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏳ Downloading {'video 🎬' if fmt == 'video' else 'audio 🎵'}… please wait."
     )
 
+    file_path = None
     try:
-        file_path = await asyncio.to_thread(download_media, url, fmt)
+        file_path = await asyncio.to_thread(download_yt, url, fmt)
     except Exception as exc:
-        logger.exception("Download error")
+        logger.exception("YT download error")
         await query.edit_message_text(f"❌ Download failed:\n`{exc}`", parse_mode="Markdown")
         return
 
@@ -242,10 +301,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Upload error")
         await query.edit_message_text(f"❌ Upload failed:\n`{exc}`", parse_mode="Markdown")
     finally:
-        try:
-            os.remove(file_path)
-        except OSError:
-            pass
+        if file_path:
+            try: os.remove(file_path)
+            except OSError: pass
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
